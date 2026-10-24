@@ -2632,11 +2632,27 @@ function createSandboxEnvironmentDriver(
       } catch {
         cleanupStatus = "failed";
       }
-      const releaseStatus = input.lease.leasePolicy === "retain_on_failure" && input.status === "failed"
-        ? "retained" as const
-        : input.status;
+      // A failed teardown leaves the provider resource active. The cleanup
+      // reaper retries only `pending_cleanup` leases, so route a failed
+      // teardown into that retry flow. A `retain_on_failure` lease keeps the
+      // resource on purpose for reuse, so it stays `retained` and never enters
+      // the reaper, which would destroy the resource the retain policy wants to
+      // keep. This is the rule `releasePluginBackedSandboxLease` already uses.
+      const retained =
+        input.lease.leasePolicy === "retain_on_failure" && input.status === "failed";
+      const releaseStatus = retained
+        ? ("retained" as const)
+        : cleanupStatus === "failed"
+          ? ("pending_cleanup" as const)
+          : input.status;
+      const failureReason =
+        input.status === "failed"
+          ? "adapter_or_run_failure"
+          : cleanupStatus === "failed"
+            ? "release_cleanup_failed"
+            : undefined;
       return await environmentsSvc.releaseLease(input.lease.id, releaseStatus, {
-        failureReason: input.status === "failed" ? "adapter_or_run_failure" : undefined,
+        failureReason,
         cleanupStatus,
       });
     },

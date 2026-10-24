@@ -1649,6 +1649,75 @@ describeEmbeddedPostgres("environmentRuntimeService", () => {
     expect(released[0]?.lease.status).toBe("released");
   });
 
+  it("leaves a failed built-in teardown on the normal release path reachable by the cleanup reaper", async () => {
+    // A failed teardown left at `released` is stranded: the reaper scans on
+    // status alone, so no teardown retry ever matches it.
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "sandbox", config: { provider: "fake", image: "ubuntu:24.04", reuseLease: false },
+    });
+    const acquired = await runtime.acquireRunLease({ companyId, environment, issueId: null,
+      heartbeatRunId: runId, persistedExecutionWorkspace: null });
+    expect(acquired.lease.leasePolicy).toBe("ephemeral");
+
+    const provider = sandboxProviderRuntime.requireSandboxProvider("fake");
+    const release = vi.spyOn(provider, "releaseLease").mockRejectedValue(new Error("injected built-in release failure"));
+    try {
+      await runtime.releaseRunLeases(runId, "released");
+      // Assert before restoring: mockRestore clears the call history.
+      expect(release).toHaveBeenCalledOnce();
+    } finally { release.mockRestore(); }
+
+    // Not `released`. The row says the teardown failed, and says why, so an
+    // operator reading a blocked execution can tell what is blocking it.
+    expect(await environmentService(db).getLeaseById(acquired.lease.id)).toMatchObject({
+      status: "pending_cleanup", cleanupStatus: "failed", failureReason: "release_cleanup_failed",
+    });
+
+    // The point of the mapping: the reaper now finds it. With the release no
+    // longer failing, one sweep tears the sandbox down and settles the row.
+    const destroy = vi.spyOn(sandboxProviderRuntime, "destroySandboxProviderLease");
+    try {
+      await heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) })
+        .sweepPendingCleanupLeases({ backoffMs: 0 });
+      expect(destroy).toHaveBeenCalledWith(expect.objectContaining({ providerLeaseId: acquired.lease.providerLeaseId }));
+    } finally { destroy.mockRestore(); }
+    expect(await environmentService(db).getLeaseById(acquired.lease.id)).toMatchObject({
+      status: "expired", cleanupStatus: "success",
+    });
+  });
+
+  it("keeps a retain_on_failure lease retained when its built-in teardown fails, and never destroys the retained resource", async () => {
+    // The other half of the pair: routing a retain lease into the reaper would
+    // destroy exactly what the retain policy exists to keep.
+    const { companyId, environment, runId } = await seedEnvironment({
+      driver: "sandbox", config: { provider: "fake", image: "ubuntu:24.04", reuseLease: false },
+    });
+    const acquired = await runtime.acquireRunLease({ companyId, environment, issueId: null,
+      heartbeatRunId: runId, persistedExecutionWorkspace: null });
+    // The sandbox driver never assigns this policy at acquire; the legacy
+    // workspace-restore and shutdown-settlement paths promote a lease to it
+    // after the fact, which is the state this release then has to handle.
+    await db.update(environmentLeases).set({ leasePolicy: "retain_on_failure" })
+      .where(eq(environmentLeases.id, acquired.lease.id));
+
+    const provider = sandboxProviderRuntime.requireSandboxProvider("fake");
+    const release = vi.spyOn(provider, "releaseLease").mockRejectedValue(new Error("injected built-in release failure"));
+    const destroy = vi.spyOn(provider, "destroyLease");
+    try {
+      await runtime.releaseRunLeases(runId, "failed");
+      expect(await environmentService(db).getLeaseById(acquired.lease.id)).toMatchObject({
+        status: "retained", cleanupStatus: "failed", failureReason: "adapter_or_run_failure",
+      });
+
+      // A retained row is not in the reaper's scan, so the sweep leaves both the
+      // row and the provider resource alone.
+      await heartbeatService(db, { environmentRuntime: environmentRuntimeService(db) })
+        .sweepPendingCleanupLeases({ backoffMs: 0 });
+      expect(await environmentService(db).getLeaseById(acquired.lease.id)).toMatchObject({ status: "retained" });
+      expect(destroy).not.toHaveBeenCalled();
+    } finally { release.mockRestore(); destroy.mockRestore(); }
+  });
+
   it.each([false, true])("confirms a built-in fake stop without release or destroy fallback: cancel=%s", async cancel => {
     const { companyId, environment, runId } = await seedEnvironment({
       driver: "sandbox", config: { provider: "fake", image: "ubuntu:24.04", reuseLease: false },
